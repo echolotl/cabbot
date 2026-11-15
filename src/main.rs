@@ -15,9 +15,9 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::OnceCell;
 use utils::data::Data;
 
-/// Global state for the application, including the Discord client and token.
+/// Global state for the bot
 struct Globals {
-    guild_id: String,
+    guild_id: GuildId,
     client: Option<Client>,
     data: Arc<AsyncMutex<Data>>,
 }
@@ -25,8 +25,28 @@ struct Globals {
 impl Globals {
     async fn get() -> &'static Mutex<Globals> {
         GLOBALS
-            .get_or_init(|| async { Mutex::new(init().await) })
+            .get_or_init(|| async { Mutex::new(Self::init().await) })
             .await
+    }
+
+    #[inline]
+    async fn init() -> Globals {
+        let discord_token = env::var("DISCORD_TOKEN").expect("DISCORD_TOKEN must be set");
+        let guild_id = env::var("GUILD_ID")
+            .expect("GUILD_ID must be set")
+            .parse::<u64>()
+            .expect("GUILD_ID must be a valid guild ID");
+        let client = Client::builder(&discord_token, GatewayIntents::empty())
+            .event_handler(Handler)
+            .await
+            .expect("Error creating client");
+        Globals {
+            guild_id: GuildId::new(guild_id),
+            client: Some(client),
+            data: Arc::new(AsyncMutex::new(
+                Data::get().expect("Failed to load birthday data"),
+            )),
+        }
     }
 }
 
@@ -81,18 +101,7 @@ impl EventHandler for Handler {
 
     async fn ready(&self, ctx: Context, ready: serenity::model::gateway::Ready) {
         println!("{} is connected!", ready.user.name);
-        let guild_id = {
-            let globals = Globals::get().await;
-            let globals = globals.lock().unwrap();
-            globals.guild_id.parse::<u64>()
-        };
-        let guild_id = match guild_id {
-            Ok(guild_id) => GuildId::new(guild_id),
-            Err(error) => {
-                eprintln!("Invalid GUILD_ID: {error}");
-                return;
-            }
-        };
+        let guild_id = Globals::get().await.lock().unwrap().guild_id;
         if let Err(error) = guild_id
             .set_commands(&ctx.http, vec![commands::birthday::register()])
             .await
@@ -126,21 +135,4 @@ async fn main() {
         println!("Client error: {why:?}");
     }
     scheduler.stop();
-}
-
-#[inline]
-async fn init() -> Globals {
-    let discord_token = env::var("DISCORD_TOKEN").expect("DISCORD_TOKEN must be set");
-    let guild_id = env::var("GUILD_ID").expect("GUILD_ID must be set");
-    let client = Client::builder(&discord_token, GatewayIntents::empty())
-        .event_handler(Handler)
-        .await
-        .expect("Error creating client");
-    Globals {
-        guild_id,
-        client: Some(client),
-        data: Arc::new(AsyncMutex::new(
-            Data::get().expect("Failed to load birthday data"),
-        )),
-    }
 }

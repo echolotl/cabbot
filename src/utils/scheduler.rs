@@ -16,6 +16,8 @@ use super::data::Data;
 
 const BIRTHDAY_SCHEDULE: &str = "0 0 22 * * *"; // 22:00 UTC, so scheduled for 00:00 UTC+2
 
+/// Scheduler for announcing birthdays at a specified time.
+/// It runs in a seperate thread.
 pub struct Scheduler {
     stop: mpsc::Sender<()>,
     thread: JoinHandle<()>,
@@ -69,6 +71,12 @@ async fn announce_birthdays(
     channel: ChannelId,
     date: NaiveDate,
 ) {
+    fn is_birthday(date: NaiveDate, month: u32, day: u32) -> bool {
+        (date.month(), date.day()) == (month, day)
+            || (month, day) == (2, 29)
+                && (date.month(), date.day()) == (2, 28)
+                && NaiveDate::from_ymd_opt(date.year(), 2, 29).is_none()
+    }
     let birthdays = data.lock().await.get_birthdays();
     for (user_id, month, day) in birthdays {
         if !is_birthday(date, month, day) {
@@ -76,17 +84,10 @@ async fn announce_birthdays(
         }
         let user = UserId::new(user_id);
         let message = CreateMessage::new()
-            .content(format!("It's <@{user_id}>'s birthday!"))
+            .content(format!("It's <@{user_id}>'s birthday!!!! 🎉🎉🎉"))
             .allowed_mentions(CreateAllowedMentions::new().users([user]));
         if let Err(error) = channel.send_message(&http, message).await {
             eprintln!("Failed to send birthday announcement for user {user_id}: {error}");
         }
     }
-}
-
-fn is_birthday(date: NaiveDate, month: u32, day: u32) -> bool {
-    (date.month(), date.day()) == (month, day)
-        || (month, day) == (2, 29)
-            && (date.month(), date.day()) == (2, 28)
-            && NaiveDate::from_ymd_opt(date.year(), 2, 29).is_none()
 }

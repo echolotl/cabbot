@@ -129,6 +129,7 @@ pub async fn run(
             let ResolvedValue::Integer(month) = month.value else {
                 return Err(BirthdayActionError::InvalidDate);
             };
+            let month = month as u32;
 
             let day = options
                 .iter()
@@ -137,6 +138,7 @@ pub async fn run(
             let ResolvedValue::Integer(day) = day.value else {
                 return Err(BirthdayActionError::InvalidDate);
             };
+            let day = day as u32;
 
             let (month, day) =
                 normalized_month_day(month, day).ok_or_else(|| BirthdayActionError::InvalidDate)?;
@@ -205,8 +207,6 @@ async fn list(http: &Http, birthdays: Vec<(u64, u32, u32)>) -> Result<String, Bi
     Ok(message)
 }
 
-fn normalized_month_day(month: i64, day: i64) -> Option<(u32, u32)> {
-    chrono::NaiveDate::parse_from_str(&format!("2000-{month:02}-{day:02}"), "%Y-%m-%d")
-        .ok()
-        .map(|date| (date.month(), date.day()))
+fn normalized_month_day(month: u32, day: u32) -> Option<(u32, u32)> {
+    chrono::NaiveDate::from_ymd_opt(2000, month, day).map(|date| (date.month(), date.day()))
 }
