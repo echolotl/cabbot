@@ -2,7 +2,10 @@ mod commands;
 mod utils;
 
 use serenity::{
-    all::{CreateInteractionResponse, CreateInteractionResponseMessage, GuildId, Interaction},
+    all::{
+        ChannelId, CreateInteractionResponse, CreateInteractionResponseMessage, GuildId,
+        Interaction,
+    },
     async_trait,
     prelude::*,
 };
@@ -103,17 +106,26 @@ impl EventHandler for Handler {
 async fn main() {
     dotenvy::dotenv().ok();
     let globals = Globals::get().await;
-    let mut client = {
+    let (mut client, data) = {
         let mut globals = globals.lock().unwrap();
-        globals
+        let client = globals
             .client
             .take()
-            .expect("Discord client was already started")
+            .expect("Discord client was already started");
+        (client, Arc::clone(&globals.data))
     };
+    let channel_id = env::var("BIRTHDAY_CHANNEL_ID")
+        .expect("BIRTHDAY_CHANNEL_ID must be set")
+        .parse::<u64>()
+        .expect("BIRTHDAY_CHANNEL_ID must be a valid channel ID");
+    assert!(channel_id != 0, "BIRTHDAY_CHANNEL_ID must not be zero");
+    let scheduler =
+        utils::scheduler::start(data, Arc::clone(&client.http), ChannelId::new(channel_id));
 
     if let Err(why) = client.start().await {
         println!("Client error: {why:?}");
     }
+    scheduler.stop();
 }
 
 #[inline]
