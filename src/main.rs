@@ -3,8 +3,8 @@ mod utils;
 
 use serenity::{
     all::{
-        CommandInteraction, CreateInteractionResponse, CreateInteractionResponseMessage, GuildId,
-        Interaction,
+        ActivityData, CommandInteraction, CreateInteractionResponse,
+        CreateInteractionResponseMessage, GuildId, Interaction, OnlineStatus,
     },
     async_trait,
     prelude::*,
@@ -68,6 +68,7 @@ impl EventHandler for Handler {
                 let result = match command.data.name.as_str() {
                     "birthday" => commands::birthday::run(&ctx, &command).await,
                     "settings" => commands::settings::run(&ctx, &command).await,
+                    "about" => commands::about::run(&ctx, &command).await,
                     _ => Err(CabbotCommandError::UnknownAction),
                 };
                 if let Err(error) = result {
@@ -96,12 +97,14 @@ impl EventHandler for Handler {
                 vec![
                     commands::birthday::register(),
                     commands::settings::register(),
+                    commands::about::register(),
                 ],
             )
             .await
         {
             eprintln!("Failed to register guild commands: {error}");
         }
+        ctx.set_presence(Some(ActivityData::custom("(i'm cozy)")), OnlineStatus::Idle);
     }
 }
 

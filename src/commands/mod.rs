@@ -1,3 +1,4 @@
+pub mod about;
 pub mod birthday;
 pub mod settings;
 
@@ -27,6 +28,11 @@ impl CabbotCommandError {
     fn save_failed(thing: &str, error: std::io::Error) -> Self {
         eprintln!("Failed to save {thing}: {error}");
         Self::SaveFailed(thing.to_string())
+    }
+
+    fn unknown(error: serenity::Error) -> Self {
+        eprintln!("An unknown error occurred: {error}");
+        Self::Unknown
     }
 }
 
