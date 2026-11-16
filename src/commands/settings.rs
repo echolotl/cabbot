@@ -6,7 +6,7 @@ use serenity::{
     builder::{CreateAutocompleteResponse, CreateCommand, CreateCommandOption},
 };
 
-use crate::{Globals, commands::CabbotCommandError};
+use crate::{commands::CabbotCommandError, utils::data::Settings};
 
 /// SETTINGS COMMAND
 /// /settings [modify|view]
@@ -66,8 +66,10 @@ pub async fn run(
     };
 
     let settings = {
-        let globals = Globals::get().await.lock().await;
-        globals.settings.clone()
+        let data = ctx.data.read().await;
+        data.get::<Settings>()
+            .expect("Settings missing from TypeMap")
+            .clone()
     };
 
     let message = match *subcommand {
@@ -103,7 +105,7 @@ pub async fn run(
                 return Err(CabbotCommandError::InvalidTextChannel);
             }
 
-            let mut settings = settings.lock().await;
+            let mut settings = settings.write().expect("Settings lock poisoned");
             let mut updated = settings.clone();
             updated.birthday_channel = channel_id;
             updated
@@ -113,7 +115,7 @@ pub async fn run(
             format!("Birthday announcements will be sent to <#{channel_id}>.")
         }
         "view" => {
-            let channel_id = settings.lock().await.birthday_channel;
+            let channel_id = settings.read().expect("Settings lock poisoned").birthday_channel;
             if channel_id == 0 {
                 "**BIRTHDAY CHANNEL**: Not set.".to_string()
             } else {

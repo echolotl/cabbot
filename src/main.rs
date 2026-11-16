@@ -3,65 +3,29 @@ mod utils;
 
 use serenity::{
     all::{
-        ActivityData, CommandInteraction, CreateInteractionResponse,
-        CreateInteractionResponseMessage, GuildId, Interaction, OnlineStatus,
-    },
-    async_trait,
-    prelude::*,
+        ActivityData, CommandInteraction, CreateCommand, CreateInteractionResponse, CreateInteractionResponseMessage, GatewayIntents, Guild, GuildId, Interaction, OnlineStatus,
+    }, async_trait, prelude::*,
 };
 use std::env;
-use std::sync::Arc;
-use tokio::sync::Mutex as AsyncMutex;
-use tokio::sync::OnceCell;
+use std::sync::{Arc, RwLock};
 use utils::data::{Data, Settings};
 
 use crate::commands::CabbotCommandError;
 
-/// Global state for the bot
-struct Globals {
+fn commands_to_register() -> Vec<CreateCommand> {
+    vec![
+        commands::birthday::register(),
+        commands::settings::register(),
+        commands::about::register(),
+    ]
+}
+
+struct Cabbot {
     guild_id: GuildId,
-    client: Option<Client>,
-    data: Arc<AsyncMutex<Data>>,
-    settings: Arc<AsyncMutex<Settings>>,
 }
-
-impl Globals {
-    async fn get() -> &'static AsyncMutex<Globals> {
-        GLOBALS
-            .get_or_init(|| async { AsyncMutex::new(Self::init().await) })
-            .await
-    }
-
-    #[inline]
-    async fn init() -> Globals {
-        let discord_token = env::var("DISCORD_TOKEN").expect("DISCORD_TOKEN must be set");
-        let guild_id = env::var("GUILD_ID")
-            .expect("GUILD_ID must be set")
-            .parse::<u64>()
-            .expect("GUILD_ID must be a valid guild ID");
-        let client = Client::builder(&discord_token, GatewayIntents::GUILD_MEMBERS)
-            .event_handler(Handler)
-            .await
-            .expect("Error creating client");
-        Globals {
-            guild_id: GuildId::new(guild_id),
-            client: Some(client),
-            data: Arc::new(AsyncMutex::new(
-                Data::get().expect("Failed to load birthday data"),
-            )),
-            settings: Arc::new(AsyncMutex::new(
-                Settings::get().expect("Failed to load settings"),
-            )),
-        }
-    }
-}
-
-static GLOBALS: OnceCell<AsyncMutex<Globals>> = OnceCell::const_new();
-
-struct Handler;
 
 #[async_trait]
-impl EventHandler for Handler {
+impl EventHandler for Cabbot {
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         match interaction {
             Interaction::Command(command) => {
@@ -90,15 +54,10 @@ impl EventHandler for Handler {
 
     async fn ready(&self, ctx: Context, ready: serenity::model::gateway::Ready) {
         println!("{} is connected!", ready.user.name);
-        let guild_id = Globals::get().await.lock().await.guild_id;
-        if let Err(error) = guild_id
+        if let Err(error) = self.guild_id
             .set_commands(
                 &ctx.http,
-                vec![
-                    commands::birthday::register(),
-                    commands::settings::register(),
-                    commands::about::register(),
-                ],
+                commands_to_register()
             )
             .await
         {
@@ -106,22 +65,37 @@ impl EventHandler for Handler {
         }
         ctx.set_presence(Some(ActivityData::custom("(i'm cozy)")), OnlineStatus::Idle);
     }
+
+    async fn guild_create(&self, ctx: Context, guild: Guild, is_new: Option<bool>) {
+        if Some(true) == is_new {
+            self.guild_id.set_commands(&ctx.http, commands_to_register()).await.unwrap();
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
-    let globals = Globals::get().await;
-    let mut globals_guard = globals.lock().await;
-    let mut client = {
-        let client = globals_guard
-            .client
-            .take()
-            .expect("Discord client was already started");
-        client
-    };
-    let scheduler = utils::scheduler::start(&*globals_guard, Arc::clone(&client.http));
-    drop(globals_guard);
+    let discord_token = env::var("DISCORD_TOKEN").expect("DISCORD_TOKEN must be set");
+    let guild_id = env::var("GUILD_ID")
+        .expect("GUILD_ID must be set")
+        .parse::<u64>()
+        .expect("GUILD_ID must be a valid guild ID");
+    let data = Arc::new(RwLock::new(
+        Data::get().expect("Failed to load birthday data"),
+    ));
+    let settings = Arc::new(RwLock::new(
+        Settings::get().expect("Failed to load settings"),
+    ));
+    let mut client = Client::builder(&discord_token, GatewayIntents::GUILD_MEMBERS)
+        .event_handler(Cabbot {
+            guild_id: GuildId::new(guild_id),
+        })
+        .type_map_insert::<Data>(Arc::clone(&data))
+        .type_map_insert::<Settings>(Arc::clone(&settings))
+        .await
+        .expect("Error creating client");
+    let scheduler = utils::scheduler::start(data, settings, Arc::clone(&client.http));
 
     if let Err(why) = client.start().await {
         println!("Client error: {why:?}");

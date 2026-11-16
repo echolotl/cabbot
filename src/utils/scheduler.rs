@@ -1,20 +1,17 @@
 use std::{
-    sync::{Arc, mpsc},
+    sync::{Arc, RwLock, mpsc},
     thread::{self, JoinHandle},
     time::Duration,
 };
 
-use crate::Globals;
 use chrono::{DateTime, Datelike, NaiveDate, Timelike, Utc};
 use serenity::{
     all::{ChannelId, Http, UserId},
     builder::{CreateAllowedMentions, CreateMessage},
 };
-use tokio::sync::Mutex;
-
 use crate::utils::data::Birthday;
 
-use super::data::Data;
+use super::data::{Data, Settings};
 
 /// Scheduler for announcing birthdays at a specified time.
 /// It runs in a seperate thread.
@@ -34,9 +31,7 @@ impl Scheduler {
     }
 }
 
-pub fn start(globals: &Globals, http: Arc<Http>) -> Scheduler {
-    let data = Arc::clone(&globals.data);
-    let settings = Arc::clone(&globals.settings);
+pub fn start(data: Arc<RwLock<Data>>, settings: Arc<RwLock<Settings>>, http: Arc<Http>) -> Scheduler {
     let runtime = tokio::runtime::Handle::current();
     let (stop, receiver) = mpsc::channel();
     let thread = thread::Builder::new()
@@ -61,9 +56,9 @@ pub fn start(globals: &Globals, http: Arc<Http>) -> Scheduler {
                     let Some(date) = (now.hour() == 0).then(|| now.date_naive()) else {
                         return;
                     };
-                    let settings = settings.lock().await;
-                    let channel = ChannelId::new(settings.birthday_channel);
-                    drop(settings);
+                    let channel = ChannelId::new(
+                        settings.read().expect("Settings lock poisoned").birthday_channel,
+                    );
                     check_and_announce_birthdays(data.clone(), http.clone(), channel, date).await;
                 });
                 let now = Utc::now();
@@ -81,7 +76,7 @@ pub fn start(globals: &Globals, http: Arc<Http>) -> Scheduler {
 }
 
 async fn check_and_announce_birthdays(
-    data: Arc<Mutex<Data>>,
+    data: Arc<RwLock<Data>>,
     http: Arc<Http>,
     channel: ChannelId,
     date: NaiveDate,
@@ -94,8 +89,7 @@ async fn check_and_announce_birthdays(
                 && (date.month(), date.day()) == (2, 28)
                 && NaiveDate::from_ymd_opt(date.year(), 2, 29).is_none()
     }
-    let data = data.lock().await;
-    let birthdays = data.birthdays.clone();
+    let birthdays = data.read().expect("Birthday data lock poisoned").birthdays.clone();
     for Birthday {
         user_id,
         month,

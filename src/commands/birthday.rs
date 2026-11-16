@@ -7,7 +7,10 @@ use serenity::{
     builder::{CreateCommand, CreateCommandOption},
 };
 
-use crate::{Globals, commands::CabbotCommandError, utils::data::Birthday};
+use crate::{
+    commands::CabbotCommandError,
+    utils::data::{Birthday, Data, Settings},
+};
 
 static MONTH_DECORATIONS: [&str; 12] = ["✫", "▰", "❀", "ꕤ", "ღ", "⚣", "✹", "❦", "▨", "֎", "✧", "❅"];
 static MONTH_NAMES: [&str; 12] = [
@@ -90,7 +93,6 @@ pub async fn run(
     interaction: &CommandInteraction,
 ) -> Result<(), CabbotCommandError> {
     let resolved_options = interaction.data.options();
-    let globals = Globals::get().await.lock().await;
     let Some(ResolvedOption {
         value: ResolvedValue::SubCommand(options),
         name: subcommand_name,
@@ -98,6 +100,14 @@ pub async fn run(
     }) = resolved_options.first()
     else {
         return Err(CabbotCommandError::MissingOption);
+    };
+
+    let (birthdays, settings) = {
+        let data = ctx.data.read().await;
+        (
+            data.get::<Data>().expect("Birthday data missing from TypeMap").clone(),
+            data.get::<Settings>().expect("Settings missing from TypeMap").clone(),
+        )
     };
 
     match *subcommand_name {
@@ -132,41 +142,34 @@ pub async fn run(
             let date = next_birthday(month, day).ok_or_else(|| CabbotCommandError::InvalidDate)?;
             let user_id = user.id.get();
 
-            let mut data = globals.data.lock().await;
-            if data.birthdays.iter().any(|b| b.user_id == user_id) {
-                interaction
-                    .create_response(
-                        ctx,
-                        CreateInteractionResponse::Message(
-                            CreateInteractionResponseMessage::new()
-                                .content("Birthday already set.")
-                                .ephemeral(true),
-                        ),
+            let message = {
+                let mut data = birthdays.write().expect("Birthday data lock poisoned");
+                if data.birthdays.iter().any(|b| b.user_id == user_id) {
+                    "Birthday already set.".to_string()
+                } else {
+                    let mut updated = data.clone();
+                    updated.birthdays.push(Birthday {
+                        user_id,
+                        month,
+                        day,
+                    });
+                    updated
+                        .save()
+                        .map_err(|error| CabbotCommandError::save_failed("birthdays", error))?;
+                    *data = updated;
+                    format!(
+                        "**{}**'s birthday has been added for {}!",
+                        user.name,
+                        format_birthday_date(date)
                     )
-                    .await
-                    .map_err(CabbotCommandError::response_failed)?;
-                return Ok(());
-            }
-            let mut updated = data.clone();
-            updated.birthdays.push(Birthday {
-                user_id,
-                month,
-                day,
-            });
-            updated
-                .save()
-                .map_err(|error| CabbotCommandError::save_failed("birthdays", error))?;
-            *data = updated;
+                }
+            };
             interaction
                 .create_response(
                     ctx,
                     CreateInteractionResponse::Message(
                         CreateInteractionResponseMessage::new()
-                            .content(format!(
-                                "**{}**'s birthday has been added for {}!",
-                                user.name,
-                                format_birthday_date(date)
-                            ))
+                            .content(message)
                             .ephemeral(true),
                     ),
                 )
@@ -185,45 +188,37 @@ pub async fn run(
             };
 
             let user_id = user.id.get();
-            let mut data = globals.data.lock().await;
-            if let Some(pos) = data.birthdays.iter().position(|b| b.user_id == user_id) {
-                let mut updated = data.clone();
-                updated.birthdays.remove(pos);
-                updated
-                    .save()
-                    .map_err(|error| CabbotCommandError::save_failed("birthdays", error))?;
-                *data = updated;
-                interaction
-                    .create_response(
-                        ctx,
-                        CreateInteractionResponse::Message(
-                            CreateInteractionResponseMessage::new()
-                                .content(format!("**{}**'s birthday has been removed.", user.name))
-                                .ephemeral(true),
-                        ),
-                    )
-                    .await
-                    .map_err(CabbotCommandError::response_failed)?;
-                Ok(())
-            } else {
-                interaction
-                    .create_response(
-                        ctx,
-                        CreateInteractionResponse::Message(
-                            CreateInteractionResponseMessage::new()
-                                .content(format!("**{}** does not have a birthday set.", user.name))
-                                .ephemeral(true),
-                        ),
-                    )
-                    .await
-                    .map_err(CabbotCommandError::response_failed)?;
-                Ok(())
-            }
+            let message = {
+                let mut data = birthdays.write().expect("Birthday data lock poisoned");
+                if let Some(pos) = data.birthdays.iter().position(|b| b.user_id == user_id) {
+                    let mut updated = data.clone();
+                    updated.birthdays.remove(pos);
+                    updated
+                        .save()
+                        .map_err(|error| CabbotCommandError::save_failed("birthdays", error))?;
+                    *data = updated;
+                    format!("**{}**'s birthday has been removed.", user.name)
+                } else {
+                    format!("**{}** does not have a birthday set.", user.name)
+                }
+            };
+            interaction
+                .create_response(
+                    ctx,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content(message)
+                            .ephemeral(true),
+                    ),
+                )
+                .await
+                .map_err(CabbotCommandError::response_failed)?;
+            Ok(())
         }
         "list" => {
-            let birthdays = globals.data.lock().await.birthdays.clone();
+            let birthdays = birthdays.read().expect("Birthday data lock poisoned").birthdays.clone();
             // Don't let the user list birthdays in any other channel than the birthday channel
-            let birthday_channel = globals.settings.lock().await.birthday_channel;
+            let birthday_channel = settings.read().expect("Settings lock poisoned").birthday_channel;
             if interaction.channel_id.get() != birthday_channel {
                 return Err(CabbotCommandError::WrongChannel(birthday_channel));
             }
