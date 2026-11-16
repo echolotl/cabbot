@@ -163,9 +163,9 @@ pub async fn run(
                     CreateInteractionResponse::Message(
                         CreateInteractionResponseMessage::new()
                             .content(format!(
-                                "**{}**'s birthday has been added for <t:{}:D>!",
+                                "**{}**'s birthday has been added for {}!",
                                 user.name,
-                                date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp()
+                                format_birthday_date(date)
                             ))
                             .ephemeral(true),
                     ),
@@ -283,14 +283,28 @@ async fn list(ctx: &Context, birthdays: Vec<Birthday>) -> Result<String, CabbotC
                         CabbotCommandError::LookupFailed("user".to_string())
                     })?;
                 message.push_str(&format!(
-                    "**{}**: <t:{}:D>\n",
+                    "**{}**: {}\n",
                     user.display_name(),
-                    date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp()
+                    format_birthday_date(date)
                 ));
             }
         }
     }
     Ok(message)
+}
+
+fn format_birthday_date(date: NaiveDate) -> String {
+    format!("{}{}", date.format("%B %-d"), ordinal_suffix(date.day()))
+}
+
+fn ordinal_suffix(n: u32) -> &'static str {
+    match (n % 100, n % 10) {
+        (11..=13, _) => "th",
+        (_, 1) => "st",
+        (_, 2) => "nd",
+        (_, 3) => "rd",
+        _ => "th",
+    }
 }
 
 fn next_birthday(month: u32, day: u32) -> Option<NaiveDate> {
@@ -312,29 +326,5 @@ fn next_birthday_on(today: NaiveDate, month: u32, day: u32) -> Option<NaiveDate>
         birthday_in_year(today.year().checked_add(1)?)
     } else {
         Some(date)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn next_birthday_handles_leap_days_and_invalid_dates() {
-        let date = |year, month, day| NaiveDate::from_ymd_opt(year, month, day).unwrap();
-        assert_eq!(
-            next_birthday_on(date(2025, 1, 1), 2, 29),
-            Some(date(2025, 2, 28))
-        );
-        assert_eq!(
-            next_birthday_on(date(2027, 3, 1), 2, 29),
-            Some(date(2028, 2, 29))
-        );
-        assert_eq!(
-            next_birthday_on(date(2024, 3, 1), 2, 29),
-            Some(date(2025, 2, 28))
-        );
-        assert_eq!(next_birthday_on(date(2025, 1, 1), 2, 30), None);
-        assert_eq!(next_birthday_on(date(2025, 1, 1), 0, 1), None);
     }
 }

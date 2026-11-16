@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::Globals;
-use chrono::{Datelike, NaiveDate, Timelike, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Timelike, Utc};
 use serenity::{
     all::{ChannelId, Http, UserId},
     builder::{CreateAllowedMentions, CreateMessage},
@@ -56,14 +56,21 @@ pub fn start(globals: &Globals, http: Arc<Http>) -> Scheduler {
             loop {
                 // Once the loop starts, we check once per hour, just because really long sleeps can drift over time.
                 runtime.block_on(async {
-                    let settings = settings.lock().await;
                     let now = Utc::now();
-                    let date = now.date_naive();
+                    // Only announce birthdays at the start of a new UTC day.
+                    let Some(date) = (now.hour() == 0).then(|| now.date_naive()) else {
+                        return;
+                    };
+                    let settings = settings.lock().await;
                     let channel = ChannelId::new(settings.birthday_channel);
                     drop(settings);
                     check_and_announce_birthdays(data.clone(), http.clone(), channel, date).await;
                 });
-                match receiver.recv_timeout(Duration::from_secs(3600)) {
+                let now = Utc::now();
+                let seconds_into_hour = u64::from(now.minute() * 60 + now.second());
+                let delay = Duration::from_secs(3600 - seconds_into_hour)
+                    - Duration::from_nanos(u64::from(now.nanosecond()));
+                match receiver.recv_timeout(delay) {
                     Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                 }
