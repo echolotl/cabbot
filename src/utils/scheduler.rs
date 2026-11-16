@@ -4,17 +4,17 @@ use std::{
     time::Duration,
 };
 
-use chrono::{Datelike, NaiveDate, Utc};
-use job_scheduler::{Job, JobScheduler, Schedule};
+use crate::Globals;
+use chrono::{Datelike, NaiveDate, Timelike, Utc};
 use serenity::{
     all::{ChannelId, Http, UserId},
     builder::{CreateAllowedMentions, CreateMessage},
 };
 use tokio::sync::Mutex;
 
-use super::data::Data;
+use crate::utils::data::Birthday;
 
-const BIRTHDAY_SCHEDULE: &str = "0 0 22 * * *"; // 22:00 UTC, so scheduled for 00:00 UTC+2
+use super::data::Data;
 
 /// Scheduler for announcing birthdays at a specified time.
 /// It runs in a seperate thread.
@@ -34,28 +34,36 @@ impl Scheduler {
     }
 }
 
-pub fn start(data: Arc<Mutex<Data>>, http: Arc<Http>, channel: ChannelId) -> Scheduler {
-    let schedule: Schedule = BIRTHDAY_SCHEDULE
-        .parse()
-        .expect("Invalid birthday scheduler cron expression");
+pub fn start(globals: &Globals, http: Arc<Http>) -> Scheduler {
+    let data = Arc::clone(&globals.data);
+    let settings = Arc::clone(&globals.settings);
     let runtime = tokio::runtime::Handle::current();
     let (stop, receiver) = mpsc::channel();
     let thread = thread::Builder::new()
         .name("birthday-scheduler".into())
         .spawn(move || {
-            let mut scheduler = JobScheduler::new();
-            scheduler.add(Job::new(schedule, move || {
-                let date = (Utc::now() + chrono::Duration::hours(2)).date_naive();
-                runtime.spawn(announce_birthdays(
-                    Arc::clone(&data),
-                    Arc::clone(&http),
-                    channel,
-                    date,
-                ));
-            }));
+            // We lock into the start of the next hour before beginning the loop.
+            let now = Utc::now();
+            let seconds_into_hour = u64::from(now.minute() * 60 + now.second());
+            let initial_delay = if seconds_into_hour == 0 && now.nanosecond() == 0 {
+                Duration::ZERO
+            } else {
+                Duration::from_secs(3600 - seconds_into_hour)
+                    - Duration::from_nanos(u64::from(now.nanosecond()))
+            };
+            thread::sleep(initial_delay);
+
             loop {
-                scheduler.tick();
-                match receiver.recv_timeout(Duration::from_millis(500)) {
+                // Once the loop starts, we check once per hour, just because really long sleeps can drift over time.
+                runtime.block_on(async {
+                    let settings = settings.lock().await;
+                    let now = Utc::now();
+                    let date = now.date_naive();
+                    let channel = ChannelId::new(settings.birthday_channel);
+                    drop(settings);
+                    check_and_announce_birthdays(data.clone(), http.clone(), channel, date).await;
+                });
+                match receiver.recv_timeout(Duration::from_secs(3600)) {
                     Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                 }
@@ -65,20 +73,28 @@ pub fn start(data: Arc<Mutex<Data>>, http: Arc<Http>, channel: ChannelId) -> Sch
     Scheduler { stop, thread }
 }
 
-async fn announce_birthdays(
+async fn check_and_announce_birthdays(
     data: Arc<Mutex<Data>>,
     http: Arc<Http>,
     channel: ChannelId,
     date: NaiveDate,
 ) {
+    // Checks if the given date matches the birthday specified by month and day.
+    // feb 29 birthdays are treated as feb 28 on non-leap years
     fn is_birthday(date: NaiveDate, month: u32, day: u32) -> bool {
         (date.month(), date.day()) == (month, day)
             || (month, day) == (2, 29)
                 && (date.month(), date.day()) == (2, 28)
                 && NaiveDate::from_ymd_opt(date.year(), 2, 29).is_none()
     }
-    let birthdays = data.lock().await.get_birthdays();
-    for (user_id, month, day) in birthdays {
+    let data = data.lock().await;
+    let birthdays = data.birthdays.clone();
+    for Birthday {
+        user_id,
+        month,
+        day,
+    } in birthdays
+    {
         if !is_birthday(date, month, day) {
             continue;
         }

@@ -3,29 +3,32 @@ mod utils;
 
 use serenity::{
     all::{
-        ChannelId, CreateInteractionResponse, CreateInteractionResponseMessage, GuildId,
+        CommandInteraction, CreateInteractionResponse, CreateInteractionResponseMessage, GuildId,
         Interaction,
     },
     async_trait,
     prelude::*,
 };
 use std::env;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::OnceCell;
-use utils::data::Data;
+use utils::data::{Data, Settings};
+
+use crate::commands::CabbotCommandError;
 
 /// Global state for the bot
 struct Globals {
     guild_id: GuildId,
     client: Option<Client>,
     data: Arc<AsyncMutex<Data>>,
+    settings: Arc<AsyncMutex<Settings>>,
 }
 
 impl Globals {
-    async fn get() -> &'static Mutex<Globals> {
+    async fn get() -> &'static AsyncMutex<Globals> {
         GLOBALS
-            .get_or_init(|| async { Mutex::new(Self::init().await) })
+            .get_or_init(|| async { AsyncMutex::new(Self::init().await) })
             .await
     }
 
@@ -36,7 +39,7 @@ impl Globals {
             .expect("GUILD_ID must be set")
             .parse::<u64>()
             .expect("GUILD_ID must be a valid guild ID");
-        let client = Client::builder(&discord_token, GatewayIntents::empty())
+        let client = Client::builder(&discord_token, GatewayIntents::GUILD_MEMBERS)
             .event_handler(Handler)
             .await
             .expect("Error creating client");
@@ -46,64 +49,55 @@ impl Globals {
             data: Arc::new(AsyncMutex::new(
                 Data::get().expect("Failed to load birthday data"),
             )),
+            settings: Arc::new(AsyncMutex::new(
+                Settings::get().expect("Failed to load settings"),
+            )),
         }
     }
 }
 
-static GLOBALS: OnceCell<Mutex<Globals>> = OnceCell::const_new();
+static GLOBALS: OnceCell<AsyncMutex<Globals>> = OnceCell::const_new();
 
 struct Handler;
 
 #[async_trait]
 impl EventHandler for Handler {
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
-        if let Interaction::Command(command) = interaction {
-            let options = command.data.options();
-            // Anyone can run the birthday list command (and everyone can see it too)
-            // TODO: Make this not hardcoded to the /birthday list if I end up adding more...
-            let ephemeral = !(command.data.name == "birthday"
-                && options.first().is_some_and(|option| option.name == "list"));
-            let permissions = command
-                .member
-                .as_ref()
-                .and_then(|member| member.permissions);
-            let response = match command.data.name.as_str() {
-                "birthday" => {
-                    let data = {
-                        let globals = Globals::get().await.lock().unwrap();
-                        Arc::clone(&globals.data)
-                    };
-                    match commands::birthday::run(&options, &data, permissions, &ctx.http).await {
-                        Ok(message) => Ok(message),
-                        Err(error) => Err(error.to_string()),
-                    }
+        match interaction {
+            Interaction::Command(command) => {
+                let result = match command.data.name.as_str() {
+                    "birthday" => commands::birthday::run(&ctx, &command).await,
+                    "settings" => commands::settings::run(&ctx, &command).await,
+                    _ => Err(CabbotCommandError::UnknownAction),
+                };
+                if let Err(error) = result {
+                    handle_bot_error(&ctx, &command, error).await;
                 }
-                _ => Err("Unknown command.".to_string()),
-            };
-            if let Err(error) = command
-                .create_response(
-                    &ctx.http,
-                    CreateInteractionResponse::Message(
-                        CreateInteractionResponseMessage::new()
-                            .content(match response {
-                                Ok(message) => message,
-                                Err(error) => error,
-                            })
-                            .ephemeral(ephemeral),
-                    ),
-                )
-                .await
-            {
-                eprintln!("Failed to respond to command: {error}");
             }
+            Interaction::Autocomplete(command) => {
+                let result = match command.data.name.as_str() {
+                    "settings" => commands::settings::autocomplete(&ctx, &command).await,
+                    _ => Err(CabbotCommandError::UnknownAction),
+                };
+                if let Err(error) = result {
+                    eprintln!("Autocomplete for {} failed: {error:?}", command.data.name);
+                }
+            }
+            _ => {}
         }
     }
 
     async fn ready(&self, ctx: Context, ready: serenity::model::gateway::Ready) {
         println!("{} is connected!", ready.user.name);
-        let guild_id = Globals::get().await.lock().unwrap().guild_id;
+        let guild_id = Globals::get().await.lock().await.guild_id;
         if let Err(error) = guild_id
-            .set_commands(&ctx.http, vec![commands::birthday::register()])
+            .set_commands(
+                &ctx.http,
+                vec![
+                    commands::birthday::register(),
+                    commands::settings::register(),
+                ],
+            )
             .await
         {
             eprintln!("Failed to register guild commands: {error}");
@@ -115,24 +109,40 @@ impl EventHandler for Handler {
 async fn main() {
     dotenvy::dotenv().ok();
     let globals = Globals::get().await;
-    let (mut client, data) = {
-        let mut globals = globals.lock().unwrap();
-        let client = globals
+    let mut globals_guard = globals.lock().await;
+    let mut client = {
+        let client = globals_guard
             .client
             .take()
             .expect("Discord client was already started");
-        (client, Arc::clone(&globals.data))
+        client
     };
-    let channel_id = env::var("BIRTHDAY_CHANNEL_ID")
-        .expect("BIRTHDAY_CHANNEL_ID must be set")
-        .parse::<u64>()
-        .expect("BIRTHDAY_CHANNEL_ID must be a valid channel ID");
-    assert!(channel_id != 0, "BIRTHDAY_CHANNEL_ID must not be zero");
-    let scheduler =
-        utils::scheduler::start(data, Arc::clone(&client.http), ChannelId::new(channel_id));
+    let scheduler = utils::scheduler::start(&*globals_guard, Arc::clone(&client.http));
+    drop(globals_guard);
 
     if let Err(why) = client.start().await {
         println!("Client error: {why:?}");
     }
     scheduler.stop();
+}
+
+async fn handle_bot_error(
+    ctx: &Context,
+    interaction: &CommandInteraction,
+    error: CabbotCommandError,
+) {
+    eprintln!("Command {} failed: {error:?}", interaction.data.name);
+    if let Err(response_error) = interaction
+        .create_response(
+            ctx,
+            CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content(format!("{}", error))
+                    .ephemeral(true),
+            ),
+        )
+        .await
+    {
+        eprintln!("Failed to report command error ({error:?}): {response_error}");
+    }
 }
