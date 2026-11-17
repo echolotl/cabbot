@@ -10,7 +10,7 @@ use serenity::{
 
 use crate::{
     commands::CabbotCommandError,
-    utils::data::{Birthday, Data, Settings, read_lock, write_lock},
+    utils::data::{Birthday, Data, GuildMutationLocks, Settings, read_lock, write_lock},
 };
 
 static MONTH_DECORATIONS: [&str; 12] = ["✫", "▰", "❀", "ꕤ", "ღ", "⚣", "✹", "❦", "▨", "֎", "✧", "❅"];
@@ -106,13 +106,16 @@ pub async fn run(
         .guild_id
         .ok_or(CabbotCommandError::GuildOnly)?
         .get();
-    let (birthdays, settings) = {
+    let (birthdays, settings, guild_locks) = {
         let data = ctx.data.read().await;
         (
             data.get::<Data>()
                 .cloned()
                 .ok_or(CabbotCommandError::MissingState)?,
             data.get::<Settings>()
+                .cloned()
+                .ok_or(CabbotCommandError::MissingState)?,
+            data.get::<GuildMutationLocks>()
                 .cloned()
                 .ok_or(CabbotCommandError::MissingState)?,
         )
@@ -149,34 +152,35 @@ pub async fn run(
 
             let date = next_birthday(month, day).ok_or_else(|| CabbotCommandError::InvalidDate)?;
             let user_id = user.id.get();
-            let message = {
-                let mut all_data = write_lock(&birthdays);
-                let mut data = all_data
-                    .get(&guild_id)
-                    .cloned()
-                    .map(Ok)
-                    .unwrap_or_else(|| Data::get(guild_id))
-                    .map_err(CabbotCommandError::unknown)?;
-                if data.birthdays.iter().any(|b| b.user_id == user_id) {
-                    warn!("Birthday already exists for user {user_id} in guild {guild_id}");
-                    "Birthday already set.".to_string()
-                } else {
-                    data.birthdays.push(Birthday {
-                        user_id,
-                        month,
-                        day,
-                    });
-                    data.save(guild_id)
-                        .map_err(|error| CabbotCommandError::save_failed("birthdays", error))?;
-                    all_data.insert(guild_id, data);
-                    info!("Added birthday for user {user_id} ({month}/{day}) in guild {guild_id}");
-                    format!(
-                        "**{}**'s birthday has been added for {}!",
-                        user.name,
-                        format_birthday_date(date)
-                    )
-                }
+            let _guild_lock = guild_locks.for_guild(guild_id).lock_owned().await;
+            let existing = { read_lock(&birthdays).get(&guild_id).cloned() };
+            let mut data = match existing {
+                Some(data) => data,
+                None => Data::get_async(guild_id)
+                    .await
+                    .map_err(CabbotCommandError::unknown)?,
             };
+            let message = if data.birthdays.iter().any(|b| b.user_id == user_id) {
+                warn!("Birthday already exists for user {user_id} in guild {guild_id}");
+                "Birthday already set.".to_string()
+            } else {
+                data.birthdays.push(Birthday {
+                    user_id,
+                    month,
+                    day,
+                });
+                data.save_async(guild_id)
+                    .await
+                    .map_err(|error| CabbotCommandError::save_failed("birthdays", error))?;
+                write_lock(&birthdays).insert(guild_id, data);
+                info!("Added birthday for user {user_id} ({month}/{day}) in guild {guild_id}");
+                format!(
+                    "**{}**'s birthday has been added for {}!",
+                    user.name,
+                    format_birthday_date(date)
+                )
+            };
+            drop(_guild_lock);
             interaction
                 .create_response(
                     ctx,
@@ -201,26 +205,28 @@ pub async fn run(
             };
 
             let user_id = user.id.get();
-            let message = {
-                let mut all_data = write_lock(&birthdays);
-                let mut data = all_data
-                    .get(&guild_id)
-                    .cloned()
-                    .map(Ok)
-                    .unwrap_or_else(|| Data::get(guild_id))
-                    .map_err(CabbotCommandError::unknown)?;
+            let _guild_lock = guild_locks.for_guild(guild_id).lock_owned().await;
+            let existing = { read_lock(&birthdays).get(&guild_id).cloned() };
+            let mut data = match existing {
+                Some(data) => data,
+                None => Data::get_async(guild_id)
+                    .await
+                    .map_err(CabbotCommandError::unknown)?,
+            };
+            let message =
                 if let Some(pos) = data.birthdays.iter().position(|b| b.user_id == user_id) {
                     data.birthdays.remove(pos);
-                    data.save(guild_id)
+                    data.save_async(guild_id)
+                        .await
                         .map_err(|error| CabbotCommandError::save_failed("birthdays", error))?;
-                    all_data.insert(guild_id, data);
+                    write_lock(&birthdays).insert(guild_id, data);
                     info!("Removed birthday for user {user_id} in guild {guild_id}");
                     format!("**{}**'s birthday has been removed.", user.name)
                 } else {
                     warn!("No birthday found for user {user_id} in guild {guild_id}");
                     format!("**{}** does not have a birthday set.", user.name)
-                }
-            };
+                };
+            drop(_guild_lock);
             interaction
                 .create_response(
                     ctx,
@@ -296,29 +302,56 @@ async fn list(ctx: &Context, birthdays: Vec<Birthday>) -> Result<String, CabbotC
                 "## {} {}:\n",
                 MONTH_DECORATIONS[month_index], MONTH_NAMES[month_index]
             ));
-            for birthday in month_birthdays {
-                let date = next_birthday(birthday.month, birthday.day)
-                    .ok_or(CabbotCommandError::InvalidDate)?;
-                let user = UserId::new(birthday.user_id)
-                    .to_user(ctx)
-                    .await
-                    .map_err(|error| {
-                        log::error!(
-                            "Failed to look up birthday user {}: {}",
-                            birthday.user_id,
-                            error
-                        );
-                        CabbotCommandError::LookupFailed("user".to_string())
-                    })?;
+            
+            // We look up users asynchronously (no more than 8 at a time, though)
+            let mut pending = month_birthdays.iter().enumerate();
+            let mut tasks = tokio::task::JoinSet::new();
+            for _ in 0..8 {
+                if let Some((index, birthday)) = pending.next() {
+                    let date = next_birthday(birthday.month, birthday.day)
+                        .ok_or(CabbotCommandError::InvalidDate)?;
+                    spawn_user_lookup(&mut tasks, ctx, index, birthday.user_id, date);
+                }
+            }
+            let mut users = Vec::with_capacity(month_birthdays.len());
+            while let Some(result) = tasks.join_next().await {
+                users.push(result.map_err(|error| {
+                    log::error!("Birthday user lookup task failed: {error}");
+                    CabbotCommandError::LookupFailed("user".to_string())
+                })??);
+                if let Some((index, birthday)) = pending.next() {
+                    let date = next_birthday(birthday.month, birthday.day)
+                        .ok_or(CabbotCommandError::InvalidDate)?;
+                    spawn_user_lookup(&mut tasks, ctx, index, birthday.user_id, date);
+                }
+            }
+            users.sort_unstable_by_key(|(index, _, _)| *index);
+            for (_, display_name, date) in users {
                 message.push_str(&format!(
-                    "**{}**: {}\n",
-                    user.display_name(),
+                    "**{display_name}**: {}\n",
                     format_birthday_date(date)
                 ));
             }
         }
     }
     Ok(message)
+}
+
+fn spawn_user_lookup(
+    tasks: &mut tokio::task::JoinSet<Result<(usize, String, NaiveDate), CabbotCommandError>>,
+    ctx: &Context,
+    index: usize,
+    user_id: u64,
+    date: NaiveDate,
+) {
+    let ctx = ctx.clone();
+    tasks.spawn(async move {
+        let user = UserId::new(user_id).to_user(ctx).await.map_err(|error| {
+            log::error!("Failed to look up birthday user {user_id}: {error}");
+            CabbotCommandError::LookupFailed("user".to_string())
+        })?;
+        Ok((index, user.display_name().to_string(), date))
+    });
 }
 
 fn format_birthday_date(date: NaiveDate) -> String {

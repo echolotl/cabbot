@@ -9,7 +9,7 @@ use serenity::{
 
 use crate::{
     commands::CabbotCommandError,
-    utils::data::{Settings, read_lock, write_lock},
+    utils::data::{GuildMutationLocks, Settings, read_lock, write_lock},
 };
 
 /// SETTINGS COMMAND
@@ -71,11 +71,16 @@ pub async fn run(
     let guild_id = interaction.guild_id.ok_or(CabbotCommandError::GuildOnly)?;
     let guild_id_value = guild_id.get();
 
-    let settings = {
+    let (settings, guild_locks) = {
         let data = ctx.data.read().await;
-        data.get::<Settings>()
-            .cloned()
-            .ok_or(CabbotCommandError::MissingState)?
+        (
+            data.get::<Settings>()
+                .cloned()
+                .ok_or(CabbotCommandError::MissingState)?,
+            data.get::<GuildMutationLocks>()
+                .cloned()
+                .ok_or(CabbotCommandError::MissingState)?,
+        )
     };
 
     let message = match *subcommand {
@@ -108,16 +113,17 @@ pub async fn run(
                 return Err(CabbotCommandError::InvalidTextChannel);
             }
 
-            let mut all_settings = write_lock(&settings);
-            let mut updated = all_settings
+            let _guild_lock = guild_locks.for_guild(guild_id_value).lock_owned().await;
+            let mut updated = read_lock(&settings)
                 .get(&guild_id_value)
                 .cloned()
                 .unwrap_or_default();
             updated.birthday_channel = channel_id;
             updated
-                .save(guild_id_value)
+                .save_async(guild_id_value)
+                .await
                 .map_err(|error| CabbotCommandError::save_failed("settings", error))?;
-            all_settings.insert(guild_id_value, updated);
+            write_lock(&settings).insert(guild_id_value, updated);
             info!(
                 "Updated birthday announcement channel to {channel_id} in guild {guild_id_value}"
             );
