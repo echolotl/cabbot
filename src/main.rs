@@ -1,7 +1,8 @@
 mod commands;
 mod utils;
 
-use log::{debug, error, info};
+use colored::Colorize;
+use log::{debug, error, info, trace, warn};
 use serenity::{
     all::{
         ActivityData, CommandInteraction, CreateCommand, CreateInteractionResponse,
@@ -98,10 +99,30 @@ impl EventHandler for Cabbot {
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
-    pretty_env_logger::formatted_builder()
-        .filter_level(log::LevelFilter::Info)
-        .parse_default_env()
-        .init();
+    fern::Dispatch::new().level(log::LevelFilter::Warn).level_for("cabbot", if cfg!(debug_assertions) {
+        log::LevelFilter::Trace
+    } else {
+        log::LevelFilter::Info
+    }).format(|out, message, record| {
+        out.finish(format_args!(
+            "{} [{}] {}",
+            format_log_header(record.level()),
+            record.module_path().unwrap_or(""),
+            message
+        ))
+    })
+    .chain(
+        fern::Dispatch::new()
+            .filter(|metadata| metadata.level() == log::Level::Error)
+            .chain(std::io::stderr()),
+    )
+    .chain(
+        fern::Dispatch::new()
+            .filter(|metadata| metadata.level() != log::Level::Error)
+            .chain(std::io::stdout()),
+    )
+    .apply()
+    .unwrap();
     info!("Starting Cabbot!");
     let discord_token = env::var("DISCORD_TOKEN").unwrap_or_else(|error| {
         error!("DISCORD_TOKEN is unavailable: {error}");
@@ -136,6 +157,10 @@ async fn main() {
         Arc::clone(&client.http),
     );
 
+    warn!("Test warning");
+    error!("Test error");
+    trace!("Test trace");
+
     info!("Connecting to Discord");
     if let Err(error) = client.start().await {
         error!("Discord client stopped with an error: {error:?}");
@@ -162,5 +187,15 @@ async fn handle_bot_error(
         .await
     {
         error!("Failed to report command error ({error:?}): {response_error}");
+    }
+}
+
+fn format_log_header(level: log::Level) -> String {
+    match level {
+        log::Level::Debug => " DEBUG ".on_purple().white().bold().to_string(),
+        log::Level::Info => format!(" {}", " INFO ".on_blue().black().bold()),
+        log::Level::Warn => format!(" {}", " WARN ".on_bright_yellow().black().bold()),
+        log::Level::Error => " ERROR ".on_red().black().bold().to_string(),
+        log::Level::Trace => " TRACE ".on_bright_magenta().black().bold().to_string(),
     }
 }
