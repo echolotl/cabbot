@@ -23,7 +23,7 @@ pub async fn run(
             ),
         )
         .await
-        .map_err(CabbotCommandError::unknown)?;
+        .map_err(CabbotCommandError::response_failed)?;
     Ok(())
 }
 

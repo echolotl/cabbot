@@ -1,4 +1,5 @@
 use chrono::{Datelike, NaiveDate, Utc};
+use log::{debug, info, warn};
 use serenity::{
     all::{
         CommandInteraction, CommandOptionType, Context, CreateInteractionResponse,
@@ -9,7 +10,7 @@ use serenity::{
 
 use crate::{
     commands::CabbotCommandError,
-    utils::data::{Birthday, Data, Settings},
+    utils::data::{Birthday, Data, Settings, read_lock, write_lock},
 };
 
 static MONTH_DECORATIONS: [&str; 12] = ["✫", "▰", "❀", "ꕤ", "ღ", "⚣", "✹", "❦", "▨", "֎", "✧", "❅"];
@@ -101,12 +102,19 @@ pub async fn run(
     else {
         return Err(CabbotCommandError::MissingOption);
     };
-
+    let guild_id = interaction
+        .guild_id
+        .ok_or(CabbotCommandError::GuildOnly)?
+        .get();
     let (birthdays, settings) = {
         let data = ctx.data.read().await;
         (
-            data.get::<Data>().expect("Birthday data missing from TypeMap").clone(),
-            data.get::<Settings>().expect("Settings missing from TypeMap").clone(),
+            data.get::<Data>()
+                .cloned()
+                .ok_or(CabbotCommandError::MissingState)?,
+            data.get::<Settings>()
+                .cloned()
+                .ok_or(CabbotCommandError::MissingState)?,
         )
     };
 
@@ -141,22 +149,27 @@ pub async fn run(
 
             let date = next_birthday(month, day).ok_or_else(|| CabbotCommandError::InvalidDate)?;
             let user_id = user.id.get();
-
             let message = {
-                let mut data = birthdays.write().expect("Birthday data lock poisoned");
+                let mut all_data = write_lock(&birthdays);
+                let mut data = all_data
+                    .get(&guild_id)
+                    .cloned()
+                    .map(Ok)
+                    .unwrap_or_else(|| Data::get(guild_id))
+                    .map_err(CabbotCommandError::unknown)?;
                 if data.birthdays.iter().any(|b| b.user_id == user_id) {
+                    warn!("Birthday already exists for user {user_id} in guild {guild_id}");
                     "Birthday already set.".to_string()
                 } else {
-                    let mut updated = data.clone();
-                    updated.birthdays.push(Birthday {
+                    data.birthdays.push(Birthday {
                         user_id,
                         month,
                         day,
                     });
-                    updated
-                        .save()
+                    data.save(guild_id)
                         .map_err(|error| CabbotCommandError::save_failed("birthdays", error))?;
-                    *data = updated;
+                    all_data.insert(guild_id, data);
+                    info!("Added birthday for user {user_id} ({month}/{day}) in guild {guild_id}");
                     format!(
                         "**{}**'s birthday has been added for {}!",
                         user.name,
@@ -189,16 +202,22 @@ pub async fn run(
 
             let user_id = user.id.get();
             let message = {
-                let mut data = birthdays.write().expect("Birthday data lock poisoned");
+                let mut all_data = write_lock(&birthdays);
+                let mut data = all_data
+                    .get(&guild_id)
+                    .cloned()
+                    .map(Ok)
+                    .unwrap_or_else(|| Data::get(guild_id))
+                    .map_err(CabbotCommandError::unknown)?;
                 if let Some(pos) = data.birthdays.iter().position(|b| b.user_id == user_id) {
-                    let mut updated = data.clone();
-                    updated.birthdays.remove(pos);
-                    updated
-                        .save()
+                    data.birthdays.remove(pos);
+                    data.save(guild_id)
                         .map_err(|error| CabbotCommandError::save_failed("birthdays", error))?;
-                    *data = updated;
+                    all_data.insert(guild_id, data);
+                    info!("Removed birthday for user {user_id} in guild {guild_id}");
                     format!("**{}**'s birthday has been removed.", user.name)
                 } else {
+                    warn!("No birthday found for user {user_id} in guild {guild_id}");
                     format!("**{}** does not have a birthday set.", user.name)
                 }
             };
@@ -216,9 +235,19 @@ pub async fn run(
             Ok(())
         }
         "list" => {
-            let birthdays = birthdays.read().expect("Birthday data lock poisoned").birthdays.clone();
+            debug!("Listing birthdays for guild {guild_id}");
+            let birthdays = read_lock(&birthdays)
+                .get(&guild_id)
+                .cloned()
+                .map(Ok)
+                .unwrap_or_else(|| Data::get(guild_id))
+                .map_err(CabbotCommandError::unknown)?
+                .birthdays;
             // Don't let the user list birthdays in any other channel than the birthday channel
-            let birthday_channel = settings.read().expect("Settings lock poisoned").birthday_channel;
+            let birthday_channel = read_lock(&settings)
+                .get(&guild_id)
+                .map(|guild_settings| guild_settings.birthday_channel)
+                .unwrap_or_else(|| Settings::default().birthday_channel);
             if interaction.channel_id.get() != birthday_channel {
                 return Err(CabbotCommandError::WrongChannel(birthday_channel));
             }
@@ -274,7 +303,11 @@ async fn list(ctx: &Context, birthdays: Vec<Birthday>) -> Result<String, CabbotC
                     .to_user(ctx)
                     .await
                     .map_err(|error| {
-                        eprintln!("Error looking up user: {}", error);
+                        log::error!(
+                            "Failed to look up birthday user {}: {}",
+                            birthday.user_id,
+                            error
+                        );
                         CabbotCommandError::LookupFailed("user".to_string())
                     })?;
                 message.push_str(&format!(

@@ -1,17 +1,19 @@
 use std::{
+    collections::HashMap,
     sync::{Arc, RwLock, mpsc},
     thread::{self, JoinHandle},
     time::Duration,
 };
 
-use chrono::{DateTime, Datelike, NaiveDate, Timelike, Utc};
+use crate::utils::data::Birthday;
+use chrono::{Datelike, NaiveDate, Timelike, Utc};
+use log::{error, info, warn};
 use serenity::{
     all::{ChannelId, Http, UserId},
     builder::{CreateAllowedMentions, CreateMessage},
 };
-use crate::utils::data::Birthday;
 
-use super::data::{Data, Settings};
+use super::data::{Data, Settings, read_lock};
 
 /// Scheduler for announcing birthdays at a specified time.
 /// It runs in a seperate thread.
@@ -23,15 +25,21 @@ pub struct Scheduler {
 impl Scheduler {
     pub fn stop(self) {
         if self.stop.send(()).is_err() {
-            eprintln!("Birthday scheduler stopped unexpectedly");
+            warn!("Birthday scheduler stop signal could not be delivered");
         }
         if self.thread.join().is_err() {
-            eprintln!("Birthday scheduler thread panicked");
+            error!("Birthday scheduler thread panicked");
+        } else {
+            info!("Birthday scheduler stopped");
         }
     }
 }
 
-pub fn start(data: Arc<RwLock<Data>>, settings: Arc<RwLock<Settings>>, http: Arc<Http>) -> Scheduler {
+pub fn start(
+    data: Arc<RwLock<HashMap<u64, Data>>>,
+    settings: Arc<RwLock<HashMap<u64, Settings>>>,
+    http: Arc<Http>,
+) -> Scheduler {
     let runtime = tokio::runtime::Handle::current();
     let (stop, receiver) = mpsc::channel();
     let thread = thread::Builder::new()
@@ -46,6 +54,7 @@ pub fn start(data: Arc<RwLock<Data>>, settings: Arc<RwLock<Settings>>, http: Arc
                 Duration::from_secs(3600 - seconds_into_hour)
                     - Duration::from_nanos(u64::from(now.nanosecond()))
             };
+            info!("Birthday scheduler started! First check in {initial_delay:?}");
             thread::sleep(initial_delay);
 
             loop {
@@ -56,10 +65,32 @@ pub fn start(data: Arc<RwLock<Data>>, settings: Arc<RwLock<Settings>>, http: Arc
                     let Some(date) = (now.hour() == 0).then(|| now.date_naive()) else {
                         return;
                     };
-                    let channel = ChannelId::new(
-                        settings.read().expect("Settings lock poisoned").birthday_channel,
-                    );
-                    check_and_announce_birthdays(data.clone(), http.clone(), channel, date).await;
+                    info!("Checking birthday announcements for {date}");
+                    let guild_settings: Vec<_> = read_lock(&settings)
+                        .iter()
+                        .map(|(guild_id, settings)| (*guild_id, settings.clone()))
+                        .collect();
+                    for (
+                        guild_id,
+                        Settings {
+                            birthday_channel, ..
+                        },
+                    ) in guild_settings
+                    {
+                        if birthday_channel == 0 {
+                            continue;
+                        }
+                        let guild_data = read_lock(&data).get(&guild_id).cloned();
+                        if let Some(guild_data) = guild_data {
+                            check_and_announce_birthdays(
+                                &guild_data,
+                                http.clone(),
+                                ChannelId::new(birthday_channel),
+                                date,
+                            )
+                            .await;
+                        }
+                    }
                 });
                 let now = Utc::now();
                 let seconds_into_hour = u64::from(now.minute() * 60 + now.second());
@@ -71,12 +102,15 @@ pub fn start(data: Arc<RwLock<Data>>, settings: Arc<RwLock<Settings>>, http: Arc
                 }
             }
         })
-        .expect("Failed to start birthday scheduler");
+        .unwrap_or_else(|error| {
+            log::error!("Failed to start birthday scheduler thread: {error}");
+            panic!("Failed to start birthday scheduler");
+        });
     Scheduler { stop, thread }
 }
 
 async fn check_and_announce_birthdays(
-    data: Arc<RwLock<Data>>,
+    data: &Data,
     http: Arc<Http>,
     channel: ChannelId,
     date: NaiveDate,
@@ -89,7 +123,7 @@ async fn check_and_announce_birthdays(
                 && (date.month(), date.day()) == (2, 28)
                 && NaiveDate::from_ymd_opt(date.year(), 2, 29).is_none()
     }
-    let birthdays = data.read().expect("Birthday data lock poisoned").birthdays.clone();
+    let birthdays = data.birthdays.clone();
     for Birthday {
         user_id,
         month,
@@ -104,7 +138,9 @@ async fn check_and_announce_birthdays(
             .content(format!("It's <@{user_id}>'s birthday!!!! 🎉🎉🎉"))
             .allowed_mentions(CreateAllowedMentions::new().users([user]));
         if let Err(error) = channel.send_message(&http, message).await {
-            eprintln!("Failed to send birthday announcement for user {user_id}: {error}");
+            error!("Failed to send birthday announcement for user {user_id}: {error}");
+        } else {
+            info!("Sent birthday announcement for user {user_id}");
         }
     }
 }

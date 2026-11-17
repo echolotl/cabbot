@@ -1,3 +1,5 @@
+use log::error;
+
 pub mod about;
 pub mod birthday;
 pub mod settings;
@@ -8,6 +10,7 @@ pub enum CabbotCommandError {
     InvalidUser,
     InvalidDate,
     InvalidTextChannel,
+    GuildOnly,
     WrongChannel(u64),
     MissingOption,
     UnknownAction,
@@ -15,23 +18,24 @@ pub enum CabbotCommandError {
     LookupFailed(String),
     ResponseFailed,
     SaveFailed(String),
+    MissingState,
     #[allow(dead_code)]
     Unknown,
 }
 
 impl CabbotCommandError {
     fn response_failed(error: serenity::Error) -> Self {
-        eprintln!("Failed to send command response: {error}");
+        error!("Failed to send command response: {error}");
         Self::ResponseFailed
     }
 
     fn save_failed(thing: &str, error: std::io::Error) -> Self {
-        eprintln!("Failed to save {thing}: {error}");
+        error!("Failed to save {thing}: {error}");
         Self::SaveFailed(thing.to_string())
     }
 
-    fn unknown(error: serenity::Error) -> Self {
-        eprintln!("An unknown error occurred: {error}");
+    fn unknown(error: std::io::Error) -> Self {
+        error!("An unknown error occurred: {error}");
         Self::Unknown
     }
 }
@@ -45,6 +49,9 @@ impl std::fmt::Display for CabbotCommandError {
             }
             CabbotCommandError::InvalidTextChannel => {
                 write!(f, "I don't think that's a channel in this server...")
+            }
+            CabbotCommandError::GuildOnly => {
+                write!(f, "This command can only be used in a server.")
             }
             CabbotCommandError::MissingOption => write!(f, "You forgot a required field!"),
             CabbotCommandError::UnknownAction => {
@@ -68,6 +75,7 @@ impl std::fmt::Display for CabbotCommandError {
             CabbotCommandError::SaveFailed(thing) => {
                 write!(f, "Failed to save {thing}.")
             }
+            CabbotCommandError::MissingState => write!(f, "The bot's data is unavailable."),
             CabbotCommandError::Unknown => {
                 write!(f, "An unknown error occurred.")
             }

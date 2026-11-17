@@ -1,3 +1,4 @@
+use log::{debug, info};
 use serenity::{
     all::{
         ChannelType, CommandInteraction, CommandOptionType, Context, CreateInteractionResponse,
@@ -6,7 +7,10 @@ use serenity::{
     builder::{CreateAutocompleteResponse, CreateCommand, CreateCommandOption},
 };
 
-use crate::{commands::CabbotCommandError, utils::data::Settings};
+use crate::{
+    commands::CabbotCommandError,
+    utils::data::{Settings, read_lock, write_lock},
+};
 
 /// SETTINGS COMMAND
 /// /settings [modify|view]
@@ -64,12 +68,14 @@ pub async fn run(
     else {
         return Err(CabbotCommandError::MissingOption);
     };
+    let guild_id = interaction.guild_id.ok_or(CabbotCommandError::GuildOnly)?;
+    let guild_id_value = guild_id.get();
 
     let settings = {
         let data = ctx.data.read().await;
         data.get::<Settings>()
-            .expect("Settings missing from TypeMap")
-            .clone()
+            .cloned()
+            .ok_or(CabbotCommandError::MissingState)?
     };
 
     let message = match *subcommand {
@@ -91,11 +97,8 @@ pub async fn run(
             let channel_id = value
                 .parse::<u64>()
                 .map_err(|_| CabbotCommandError::InvalidTextChannel)?;
-            let guild_id = interaction
-                .guild_id
-                .ok_or(CabbotCommandError::InvalidTextChannel)?;
             let channels = guild_id.channels(&ctx.http).await.map_err(|error| {
-                eprintln!("Error looking up channel: {}", error);
+                log::error!("Failed to look up channels for guild {guild_id}: {error}");
                 CabbotCommandError::LookupFailed("channel".to_string())
             })?;
             if !channels
@@ -105,17 +108,27 @@ pub async fn run(
                 return Err(CabbotCommandError::InvalidTextChannel);
             }
 
-            let mut settings = settings.write().expect("Settings lock poisoned");
-            let mut updated = settings.clone();
+            let mut all_settings = write_lock(&settings);
+            let mut updated = all_settings
+                .get(&guild_id_value)
+                .cloned()
+                .unwrap_or_default();
             updated.birthday_channel = channel_id;
             updated
-                .save()
+                .save(guild_id_value)
                 .map_err(|error| CabbotCommandError::save_failed("settings", error))?;
-            *settings = updated;
+            all_settings.insert(guild_id_value, updated);
+            info!(
+                "Updated birthday announcement channel to {channel_id} in guild {guild_id_value}"
+            );
             format!("Birthday announcements will be sent to <#{channel_id}>.")
         }
         "view" => {
-            let channel_id = settings.read().expect("Settings lock poisoned").birthday_channel;
+            debug!("Viewed settings for guild {guild_id_value}");
+            let channel_id = read_lock(&settings)
+                .get(&guild_id_value)
+                .map(|guild_settings| guild_settings.birthday_channel)
+                .unwrap_or_default();
             if channel_id == 0 {
                 "**BIRTHDAY CHANNEL**: Not set.".to_string()
             } else {
@@ -154,7 +167,7 @@ pub async fn autocomplete(
         .guild_id
         .ok_or(CabbotCommandError::InvalidTextChannel)?;
     let channels = guild_id.channels(&ctx.http).await.map_err(|error| {
-        eprintln!("Error looking up channel: {}", error);
+        log::error!("Failed to look up channels for guild {guild_id}: {error}");
         CabbotCommandError::LookupFailed("channel".to_string())
     })?;
     let query = focused.value.trim_start_matches('#').to_lowercase();
