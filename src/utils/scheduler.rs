@@ -28,12 +28,12 @@ pub struct Scheduler {
 impl Scheduler {
     pub async fn stop(self) {
         if self.stop.send(()).is_err() {
-            warn!("Birthday scheduler stop signal could not be delivered");
+            warn!("The scheduler's stop signal could not be delivered");
         }
         if self.task.await.is_err() {
-            error!("Birthday scheduler task panicked");
+            error!("Scheduler task panicked");
         } else {
-            info!("Birthday scheduler stopped");
+            info!("Scheduler stopped");
         }
     }
 }
@@ -46,7 +46,7 @@ pub fn start(
     let (stop, mut stopped) = oneshot::channel();
     let task = tokio::spawn(async move {
         let initial_delay = duration_until_next_hour();
-        info!("Birthday scheduler started! First check in {initial_delay:?}");
+        info!("Scheduler started! First check in {initial_delay:?}");
         let mut ticker = interval_at(Instant::now() + initial_delay, Duration::from_secs(3600));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 

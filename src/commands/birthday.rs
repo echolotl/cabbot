@@ -3,14 +3,17 @@ use log::{debug, info, warn};
 use serenity::{
     all::{
         CommandInteraction, CommandOptionType, Context, CreateInteractionResponse,
-        CreateInteractionResponseMessage, Permissions, ResolvedOption, ResolvedValue, UserId,
+        CreateInteractionResponseMessage, Permissions, ResolvedOption, ResolvedValue,
     },
     builder::{CreateCommand, CreateCommandOption},
 };
 
 use crate::{
     commands::CabbotCommandError,
-    utils::data::{Birthday, Data, GuildMutationLocks, Settings, read_lock, write_lock},
+    utils::{
+        data::{Birthday, Data, GuildMutationLocks, Settings, read_lock, write_lock},
+        discord::user_lookup,
+    },
 };
 
 static MONTH_DECORATIONS: [&str; 12] = ["✫", "▰", "❀", "ꕤ", "ღ", "⚣", "✹", "❦", "▨", "֎", "✧", "❅"];
@@ -302,33 +305,23 @@ async fn list(ctx: &Context, birthdays: Vec<Birthday>) -> Result<String, CabbotC
                 "## {} {}:\n",
                 MONTH_DECORATIONS[month_index], MONTH_NAMES[month_index]
             ));
-            
-            // We look up users asynchronously (no more than 8 at a time, though)
-            let mut pending = month_birthdays.iter().enumerate();
-            let mut tasks = tokio::task::JoinSet::new();
-            for _ in 0..8 {
-                if let Some((index, birthday)) = pending.next() {
-                    let date = next_birthday(birthday.month, birthday.day)
-                        .ok_or(CabbotCommandError::InvalidDate)?;
-                    spawn_user_lookup(&mut tasks, ctx, index, birthday.user_id, date);
-                }
-            }
-            let mut users = Vec::with_capacity(month_birthdays.len());
-            while let Some(result) = tasks.join_next().await {
-                users.push(result.map_err(|error| {
-                    log::error!("Birthday user lookup task failed: {error}");
-                    CabbotCommandError::LookupFailed("user".to_string())
-                })??);
-                if let Some((index, birthday)) = pending.next() {
-                    let date = next_birthday(birthday.month, birthday.day)
-                        .ok_or(CabbotCommandError::InvalidDate)?;
-                    spawn_user_lookup(&mut tasks, ctx, index, birthday.user_id, date);
-                }
-            }
-            users.sort_unstable_by_key(|(index, _, _)| *index);
-            for (_, display_name, date) in users {
+
+            let dates = month_birthdays
+                .iter()
+                .map(|birthday| {
+                    next_birthday(birthday.month, birthday.day)
+                        .ok_or(CabbotCommandError::InvalidDate)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let user_ids = month_birthdays
+                .iter()
+                .map(|birthday| birthday.user_id)
+                .collect();
+            let users = user_lookup(ctx, user_ids).await?;
+            for (user, date) in users.iter().zip(dates) {
                 message.push_str(&format!(
-                    "**{display_name}**: {}\n",
+                    "**{}**: {}\n",
+                    user.name,
                     format_birthday_date(date)
                 ));
             }
@@ -337,35 +330,17 @@ async fn list(ctx: &Context, birthdays: Vec<Birthday>) -> Result<String, CabbotC
     Ok(message)
 }
 
-fn spawn_user_lookup(
-    tasks: &mut tokio::task::JoinSet<Result<(usize, String, NaiveDate), CabbotCommandError>>,
-    ctx: &Context,
-    index: usize,
-    user_id: u64,
-    date: NaiveDate,
-) {
-    let ctx = ctx.clone();
-    tasks.spawn(async move {
-        let user = UserId::new(user_id).to_user(ctx).await.map_err(|error| {
-            log::error!("Failed to look up birthday user {user_id}: {error}");
-            CabbotCommandError::LookupFailed("user".to_string())
-        })?;
-        Ok((index, user.display_name().to_string(), date))
-    });
-}
-
 fn format_birthday_date(date: NaiveDate) -> String {
-    format!("{}{}", date.format("%B %-d"), ordinal_suffix(date.day()))
-}
-
-fn ordinal_suffix(n: u32) -> &'static str {
-    match (n % 100, n % 10) {
-        (11..=13, _) => "th",
-        (_, 1) => "st",
-        (_, 2) => "nd",
-        (_, 3) => "rd",
-        _ => "th",
+    fn ordinal_suffix(n: u32) -> &'static str {
+        match (n % 100, n % 10) {
+            (11..=13, _) => "th",
+            (_, 1) => "st",
+            (_, 2) => "nd",
+            (_, 3) => "rd",
+            _ => "th",
+        }
     }
+    format!("{}{}", date.format("%B %-d"), ordinal_suffix(date.day()))
 }
 
 fn next_birthday(month: u32, day: u32) -> Option<NaiveDate> {
