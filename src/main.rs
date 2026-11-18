@@ -60,7 +60,7 @@ impl EventHandler for Cabbot {
     }
 
     async fn ready(&self, ctx: Context, ready: serenity::model::gateway::Ready) {
-        info!("{} is connected", ready.user.name);
+        info!("{} is connected!", ready.user.name.to_string().bold());
         for guild in ready.guilds {
             if let Err(error) = guild
                 .id
@@ -107,7 +107,7 @@ async fn main() {
         out.finish(format_args!(
             "{} [{}] {}",
             format_log_header(record.level()),
-            record.module_path().unwrap_or(""),
+            record.module_path().unwrap_or("").bright_black(),
             message
         ))
     })
