@@ -15,7 +15,7 @@ use std::env;
 use std::sync::{Arc, RwLock};
 
 use crate::commands::CabbotCommandError;
-use crate::utils::data::{Data, Settings, read_lock};
+use crate::utils::data::{Data, GuildMutationLocks, Settings, read_lock};
 
 fn commands_to_register() -> Vec<CreateCommand> {
     vec![
@@ -146,6 +146,7 @@ async fn main() {
         .event_handler(Cabbot {})
         .type_map_insert::<Data>(Arc::clone(&data))
         .type_map_insert::<Settings>(Arc::clone(&settings))
+        .type_map_insert::<GuildMutationLocks>(Arc::new(GuildMutationLocks::default()))
         .await
         .unwrap_or_else(|error| {
             error!("Failed to create Discord client: {error}");
@@ -156,16 +157,11 @@ async fn main() {
         Arc::clone(&settings),
         Arc::clone(&client.http),
     );
-
-    warn!("Test warning");
-    error!("Test error");
-    trace!("Test trace");
-
     info!("Connecting to Discord");
     if let Err(error) = client.start().await {
         error!("Discord client stopped with an error: {error:?}");
     }
-    scheduler.stop();
+    scheduler.stop().await;
     info!("Cabbot shut down");
 }
 

@@ -5,7 +5,7 @@ use std::{
     collections::HashMap,
     io,
     path::PathBuf,
-    sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
+    sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 
 pub fn read_lock<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
@@ -25,12 +25,36 @@ static DATA_DIR: &str = "data";
 // x.y.z versioning
 // z: Update when making backward-compatible or easily fixable changes
 // y: Update when adding a new field or any other backward-incompatible change
-// x: Update when making major changes 
+// x: Update when making major changes
 static DATA_VERSION: &str = "1.0.1";
 static SETTINGS_VERSION: &str = "1.0.0";
 
+/// Keeps track of locks for each guild so async operations don't conflict with each other
+#[derive(Default)]
+pub struct GuildMutationLocks {
+    locks: Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl GuildMutationLocks {
+    pub fn for_guild(&self, guild_id: u64) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(
+            locks
+                .entry(guild_id)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    }
+}
+
+impl TypeMapKey for GuildMutationLocks {
+    type Value = Arc<Self>;
+}
+
 /// A user's birthday.
-#[derive(Clone, Serialize, Deserialize, Hash, Default)]
+#[derive(Clone, Serialize, Deserialize, Hash, Default, PartialEq, Eq)]
 pub struct Birthday {
     pub user_id: u64,
     #[serde(rename = "m")]
@@ -39,26 +63,12 @@ pub struct Birthday {
     pub day: u32,
 }
 
-impl PartialEq for Birthday {
-    fn eq(&self, other: &Self) -> bool {
-        self.user_id == other.user_id && self.month == other.month && self.day == other.day
-    }
-}
-impl Eq for Birthday {}
-
 /// The persistent data structure for the bot.
-#[derive(Clone, Serialize, Deserialize, Hash, Default)]
+#[derive(Clone, Serialize, Deserialize, Hash, Default, PartialEq, Eq)]
 pub struct Data {
     version: String,
     pub birthdays: Vec<Birthday>,
 }
-
-impl PartialEq for Data {
-    fn eq(&self, other: &Self) -> bool {
-        self.version == other.version && self.birthdays == other.birthdays
-    }
-}
-impl Eq for Data {}
 
 impl TypeMapKey for Data {
     type Value = Arc<RwLock<HashMap<u64, Data>>>;
@@ -84,7 +94,21 @@ impl TypeMapKey for Settings {
     type Value = Arc<RwLock<HashMap<u64, Settings>>>;
 }
 
+/// A trait for types that migrate their data structure to the current version.
+trait Migratable {
+    /// Migrates the given JSON value to the current data version. Returns true if any changes were made.
+    fn migrate(value: &mut serde_json::Value) -> bool;
+}
+
 impl Data {
+    /// Gets the data for a specific guild asynchronously.
+    pub async fn get_async(guild_id: u64) -> io::Result<Self> {
+        tokio::task::spawn_blocking(move || Self::get(guild_id))
+            .await
+            .map_err(io::Error::other)?
+    }
+
+    /// Gets the data for a specific guild.
     pub fn get(guild_id: u64) -> io::Result<Self> {
         let path: PathBuf = [DATA_DIR, &guild_id.to_string(), DATA_FILE_PATH]
             .iter()
@@ -115,7 +139,7 @@ impl Data {
         }
     }
 
-    /// Retrieve all data for all guilds as a HashMap keyed by guild ID.
+    /// Retrieves all data for all guilds synchronously, for the in-memory cache.
     pub fn get_all() -> io::Result<HashMap<u64, Self>> {
         let mut all_data = HashMap::new();
         for guild_id in get_all_guilds()? {
@@ -124,6 +148,7 @@ impl Data {
         Ok(all_data)
     }
 
+    /// Saves the data for a specific guild synchronously.
     pub fn save(&self, guild_id: u64) -> io::Result<()> {
         let path: PathBuf = [DATA_DIR, &guild_id.to_string()].iter().collect();
         std::fs::create_dir_all(&path)?;
@@ -136,6 +161,16 @@ impl Data {
         Ok(())
     }
 
+    /// Saves the data for a specific guild asynchronously.
+    pub async fn save_async(&self, guild_id: u64) -> io::Result<()> {
+        let data = self.clone();
+        tokio::task::spawn_blocking(move || data.save(guild_id))
+            .await
+            .map_err(io::Error::other)?
+    }
+}
+
+impl Migratable for Data {
     fn migrate(value: &mut serde_json::Value) -> bool {
         let mut changed = false;
 
@@ -213,6 +248,15 @@ impl Settings {
         Ok(())
     }
 
+    pub async fn save_async(&self, guild_id: u64) -> io::Result<()> {
+        let settings = self.clone();
+        tokio::task::spawn_blocking(move || settings.save(guild_id))
+            .await
+            .map_err(io::Error::other)?
+    }
+}
+
+impl Migratable for Settings {
     fn migrate(value: &mut serde_json::Value) -> bool {
         let mut changed = false;
 
